@@ -8618,6 +8618,18 @@ video {
 
         // Núcleo reutilizable: hace la llamada al Worker y guarda el resultado. No muestra alerts ni toca el DOM,
         // para poder usarse tanto desde el botón individual como desde el lote masivo.
+        function nptErrorConexionEvaluacion(error) {
+            if (typeof location !== 'undefined' && location.protocol === 'file:') {
+                return new Error('Esta copia se abrió como archivo local. La evaluación con IA debe ejecutarse desde la página publicada por HTTPS, cuyo origen esté autorizado por el servicio de evaluación. Abre el sistema desde su dirección web y vuelve a intentarlo.');
+            }
+            if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+                return new Error('El equipo aparece sin conexión a Internet. Restablece la conexión y vuelve a ejecutar la rúbrica.');
+            }
+            const causa = texto(error?.message || 'fallo de red o política CORS');
+            console.error('[IA] No se pudo establecer conexión con el Worker de evaluación:', causa);
+            return new Error('No se pudo conectar con el servicio de evaluación IA. La solicitud no llegó a recibir una respuesta HTTP; revisa la disponibilidad del Worker y que permita solicitudes CORS desde esta página. Si el problema continúa, el administrador debe revisar los registros del Worker.');
+        }
+
         async function evaluarConIACore(cedula, numTrimestre, tipo) {
             // "tipo" es la CLAVE de almacenamiento (nptArchivos/nptEvaluacionesIA): para un envío
             // normal es el tipo base ('insumo1'...); para una recuperación es "{tipo}Recuperacion".
@@ -8634,7 +8646,12 @@ video {
             if (!rubrica) throw new Error(`No hay una rúbrica${esRecuperacionTipo ? ' de RECUPERACIÓN' : ''} de "${tipoBase}" guardada para ${est.curso} "${est.paralelo}" en este trimestre. Ve a "⚙️ Gestionar" y escríbela primero.`);
             let arch = nptArchivos[cedula]?.[`trimestre${numTrimestre}`]?.[tipo];
             if (arch && !arch.url && (!arch.base64 || arch.base64 === '[cargado]')) {
-                arch = await leerValorRutaFirebase(`nptArchivos/${cedula}/trimestre${numTrimestre}/${tipo}`);
+                try {
+                    arch = await leerValorRutaFirebase(`nptArchivos/${cedula}/trimestre${numTrimestre}/${tipo}`);
+                } catch (errorLectura) {
+                    console.error('[IA] Falló la lectura del archivo de entrega en Firebase:', errorLectura);
+                    throw new Error(`No se pudo recuperar el archivo de entrega desde Firebase (${texto(errorLectura?.message || 'error de lectura')}). Verifica la sesión docente y los permisos de lectura de nptArchivos/${cedula}.`);
+                }
             }
             if (!arch) throw new Error('No se encontró ninguna entrega de este estudiante para este insumo.');
             if (!NPT_EVAL_API_ENDPOINT) throw new Error('La evaluación automática no está configurada todavía: falta definir, en el código, la URL de tu backend/proxy propio.');
@@ -8667,11 +8684,15 @@ video {
             } catch (fallaRed) {
                 console.warn('Falla de red al llamar al Worker, reintentando una vez en 3s:', fallaRed.message);
                 await new Promise(r => setTimeout(r, 3000));
-                resp = await fetch(NPT_EVAL_API_ENDPOINT, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'X-NPT-Auth': NPT_AUTH_HEADER },
-                    body: JSON.stringify(payload)
-                });
+                try {
+                    resp = await fetch(NPT_EVAL_API_ENDPOINT, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-NPT-Auth': NPT_AUTH_HEADER },
+                        body: JSON.stringify(payload)
+                    });
+                } catch (reintentoRed) {
+                    throw nptErrorConexionEvaluacion(reintentoRed);
+                }
             }
             if (!resp.ok) {
                 let mensajeError = `HTTP ${resp.status}`;
@@ -8753,7 +8774,16 @@ video {
                 sinEvidencia: data.sinEvidencia === true,
                 advertenciaIntegridad
             };
-            await guardarValorFirebase(`nptEvaluacionesIA/${cedula}/trimestre${numTrimestre}/${tipo}`, registro);
+            try {
+                await guardarValorFirebase(`nptEvaluacionesIA/${cedula}/trimestre${numTrimestre}/${tipo}`, registro);
+            } catch (errorGuardado) {
+                console.error('[IA] La rúbrica respondió, pero Firebase rechazó o no completó el guardado:', errorGuardado);
+                const detalle = texto(errorGuardado?.message || 'error desconocido');
+                if (/permission_denied|permission denied|RTDB REST 401|RTDB REST 403/i.test(detalle)) {
+                    throw new Error(`La evaluación se generó, pero Firebase rechazó guardarla (permiso denegado). Comprueba que la sesión docente corresponde al UID autorizado en las reglas de nptEvaluacionesIA. Detalle: ${detalle}`);
+                }
+                throw new Error(`La evaluación se generó, pero no se pudo guardar en Firebase. Comprueba la conexión y los permisos de escritura de nptEvaluacionesIA. Detalle: ${detalle}`);
+            }
             if (!nptEvaluacionesIA[cedula]) nptEvaluacionesIA[cedula] = {};
             if (!nptEvaluacionesIA[cedula][`trimestre${numTrimestre}`]) nptEvaluacionesIA[cedula][`trimestre${numTrimestre}`] = {};
             nptEvaluacionesIA[cedula][`trimestre${numTrimestre}`][tipo] = registro;
